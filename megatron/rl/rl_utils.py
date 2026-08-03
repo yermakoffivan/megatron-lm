@@ -287,8 +287,8 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
-    policy_epoch: list[list[int]]
-    kv_cache_epoch: list[list[int]]
+    policy_epoch: list[list[tuple[int, int]]]
+    kv_cache_epoch: list[list[tuple[int, int]]]
     completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
 
@@ -858,6 +858,45 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     return ((rewards - reward_means) / (1e-4 + reward_stds)).tolist()
 
 
+def expand_epoch_segments(
+    per_turn_boundaries: list[list[tuple[int, int]]],
+    per_turn_token_counts: list[int],
+) -> list[tuple[int, int]]:
+    """Expand RLE (start_token_index, epoch) boundaries into (epoch, token_count) segments."""
+    segments: list[tuple[int, int]] = []
+    for boundaries, total_len in zip(per_turn_boundaries, per_turn_token_counts):
+        if not boundaries:
+            continue
+        for idx, (start, epoch) in enumerate(boundaries):
+            end = boundaries[idx + 1][0] if idx + 1 < len(boundaries) else total_len
+            count = end - start
+            if count > 0:
+                segments.append((epoch, count))
+    return segments
+
+
+def merge_epoch_segments(
+    policy_segments: list[tuple[int, int]], kv_segments: list[tuple[int, int]]
+) -> Iterator[tuple[int, int, int]]:
+    """Yield (policy_epoch, kv_cache_epoch, token_count) runs over shared token positions."""
+    pol_idx = kv_idx = 0
+    pol_left = policy_segments[0][1] if policy_segments else 0
+    kv_left = kv_segments[0][1] if kv_segments else 0
+    while pol_idx < len(policy_segments) and kv_idx < len(kv_segments):
+        take = min(pol_left, kv_left)
+        yield (policy_segments[pol_idx][0], kv_segments[kv_idx][0], take)
+        pol_left -= take
+        kv_left -= take
+        if pol_left == 0:
+            pol_idx += 1
+            if pol_idx < len(policy_segments):
+                pol_left = policy_segments[pol_idx][1]
+        if kv_left == 0:
+            kv_idx += 1
+            if kv_idx < len(kv_segments):
+                kv_left = kv_segments[kv_idx][1]
+
+
 def compute_group_stats(
     rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int,
 ) -> RolloutStats:
@@ -933,8 +972,22 @@ def compute_group_stats(
             group_traj_lengths.append(sum(roll_turn_lens))
             assert rollout.policy_epoch, "Rollout has no policy_epoch data"
             assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
-            group_policy_epoch.append([epoch for turn in rollout.policy_epoch for _, epoch in turn])
-            group_kv_epoch.append([epoch for turn in rollout.kv_cache_epoch for _, epoch in turn])
+            if isinstance(rollout, TokenRollout):
+                cumulative_turn_lens = [len(t) for t in rollout.trajectory]
+                group_policy_epoch.append(
+                    expand_epoch_segments(rollout.policy_epoch, cumulative_turn_lens)
+                )
+                group_kv_epoch.append(
+                    expand_epoch_segments(rollout.kv_cache_epoch, cumulative_turn_lens)
+                )
+            else:
+                # Text rollouts carry no token counts; weight each segment once.
+                group_policy_epoch.append(
+                    [(epoch, 1) for turn in rollout.policy_epoch for _, epoch in turn]
+                )
+                group_kv_epoch.append(
+                    [(epoch, 1) for turn in rollout.kv_cache_epoch for _, epoch in turn]
+                )
             # completed_epochs is per-turn, so it cannot be masked per-rollout downstream
             if rollout.trajectory:
                 group_completed_epochs.extend(
@@ -1011,8 +1064,8 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories. Zero means failure.
         advantages: Flattened list of advantages.
-        policy_epoch: Grouped list of per-token policy epoch stamps.
-        kv_cache_epoch: Grouped list of per-token KV cache epoch stamps.
+        policy_epoch: Grouped list of per-rollout (epoch, token_count) segments.
+        kv_cache_epoch: Grouped list of per-rollout (epoch, token_count) segments.
         completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
         current_iteration: Current training iteration.
@@ -1048,22 +1101,47 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    # Per-rollout staleness (oldest token)
-    rollout_policy_staleness = [current_iteration - r[0] for g in policy_epoch_real for r in g]
-    rollout_kv_staleness = [current_iteration - r[0] for g in kv_cache_epoch_real for r in g]
+    # Per-rollout staleness (oldest token). Epoch rows are (epoch, token_count) segments;
+    # a segment's first/last epoch is its first/last token's epoch.
+    rollout_policy_staleness = [current_iteration - r[0][0] for g in policy_epoch_real for r in g]
+    rollout_kv_staleness = [current_iteration - r[0][0] for g in kv_cache_epoch_real for r in g]
     # Per-rollout staleness (newest token)
     rollout_policy_last_token_staleness = [
-        current_iteration - r[-1] for g in policy_epoch_real for r in g
+        current_iteration - r[-1][0] for g in policy_epoch_real for r in g
     ]
     rollout_kv_last_token_staleness = [
-        current_iteration - r[-1] for g in kv_cache_epoch_real for r in g
+        current_iteration - r[-1][0] for g in kv_cache_epoch_real for r in g
     ]
-    # Per-token staleness
-    per_token_policy_staleness = [
-        current_iteration - e for g in policy_epoch_real for r in g for e in r
+    # Exact token-weighted per-rollout average staleness.
+    rollout_policy_avg_staleness = [
+        current_iteration - sum(e * c for e, c in r) / sum(c for _, c in r)
+        for g in policy_epoch_real
+        for r in g
     ]
-    per_token_kv_staleness = [
-        current_iteration - e for g in kv_cache_epoch_real for r in g for e in r
+    rollout_kv_avg_staleness = [
+        current_iteration - sum(e * c for e, c in r) / sum(c for _, c in r)
+        for g in kv_cache_epoch_real
+        for r in g
+    ]
+    # Token-weighted within-rollout staleness dispersion.
+    rollout_policy_staleness_std = [
+        (sum(c * (current_iteration - e - m) ** 2 for e, c in r) / sum(c for _, c in r)) ** 0.5
+        for r, m in zip((r for g in policy_epoch_real for r in g), rollout_policy_avg_staleness)
+    ]
+    rollout_kv_staleness_std = [
+        (sum(c * (current_iteration - e - m) ** 2 for e, c in r) / sum(c for _, c in r)) ** 0.5
+        for r, m in zip((r for g in kv_cache_epoch_real for r in g), rollout_kv_avg_staleness)
+    ]
+    # Per-token staleness as (rollout, policy, kv, token_count) rows.
+    per_token_staleness_rows = [
+        (rollout_idx, current_iteration - pol_e, current_iteration - kv_e, count)
+        for rollout_idx, (pol_row, kv_row) in enumerate(
+            zip(
+                (r for g in policy_epoch_real for r in g),
+                (r for g in kv_cache_epoch_real for r in g),
+            )
+        )
+        for pol_e, kv_e, count in merge_epoch_segments(pol_row, kv_row)
     ]
 
     metrics = {
@@ -1091,6 +1169,8 @@ def prep_wandb_metrics(
                     'reward', 'traj_length', 'num_evictions',
                     'policy_staleness', 'kv_staleness',
                     'policy_last_token_staleness', 'kv_last_token_staleness',
+                    'policy_avg_staleness', 'kv_avg_staleness',
+                    'policy_staleness_std', 'kv_staleness_std',
                 ],
                 data=list(zip(
                     table_rewards,
@@ -1100,12 +1180,17 @@ def prep_wandb_metrics(
                     rollout_kv_staleness,
                     rollout_policy_last_token_staleness,
                     rollout_kv_last_token_staleness,
+                    rollout_policy_avg_staleness,
+                    rollout_kv_avg_staleness,
+                    rollout_policy_staleness_std,
+                    rollout_kv_staleness_std,
                 )),
             ),
-            # NOTE: This table can get very large (one row per token across all rollouts).
+            # NOTE: rows are not individual tokens, but instead compressed data.
+            # The same information is contained, but it takes less space.
             'per_token_table': wandb_writer.Table(
-                columns=['policy_staleness', 'kv_staleness'],
-                data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
+                columns=['rollout', 'policy_staleness', 'kv_staleness', 'token_count'],
+                data=per_token_staleness_rows,
             ),
             # Group-level length/turn stats skip groups with all failed rollouts.
             'mean_turn_length': np.mean([np.mean(g) for g in turn_lens if g]),
@@ -1138,13 +1223,17 @@ def prep_wandb_metrics(
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
-            'per_token_policy_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
-                'staleness', 'Per-Token Policy Staleness'
+            'rollout_avg_policy_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(
+                    columns=['staleness'], data=[[s] for s in rollout_policy_avg_staleness]
+                ),
+                'staleness', 'Per-Rollout Token-Weighted Avg Policy Staleness'
             ),
-            'per_token_kv_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
-                'staleness', 'Per-Token KV Cache Staleness'
+            'rollout_avg_kv_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(
+                    columns=['staleness'], data=[[s] for s in rollout_kv_avg_staleness]
+                ),
+                'staleness', 'Per-Rollout Token-Weighted Avg KV Cache Staleness'
             ),
             **failure_metrics,
     }
